@@ -1,46 +1,50 @@
-<# OpenCars Setup v1.7 - instalación robusta + fondo/lockscreen #>
+<# OpenCars Setup v1.8
+ - Auto-elevate
+ - Winget apps (Acrobat, Chrome, WinRAR, TeamViewer+upgrade, AnyDesk con fallback, WireGuard)
+ - Office 365 (Word/Excel/PowerPoint) vía ODT oficial
+ - Fondo (convierte JFIF→JPG con WPF/WIC) + aplica con SystemParametersInfo
+ - Lock screen (desactiva Spotlight y fija imagen)
+ - Ricoh PCL6 (EXE oficial) + Quiter (EXE desde tu repo)
+ - Logging en C:\ProgramData\OpenCars\setup-logs\
+#>
 
-# --- Auto-elevate ---
+# ===================== Auto-elevate =====================
 $u=[Security.Principal.WindowsIdentity]::GetCurrent()
 $p=New-Object Security.Principal.WindowsPrincipal($u)
 if(-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
-  Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`""; exit
+  Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
+  exit
 }
 
-# === URLs (ajustá si cambia algo) ===
+# ===================== CONFIG =====================
 $WallpaperUrl   = "https://raw.githubusercontent.com/Fortecar/setup/main/Tumbnail.jfif"
 $LockScreenUrl  = "https://raw.githubusercontent.com/Fortecar/setup/main/Tumbnail.jfif"
 $QuiterUrl      = "https://raw.githubusercontent.com/Fortecar/setup/main/quiter.exe"
 $RicohDriverUrl = "https://support.ricoh.com/bb/pub_e/dr_ut_e/0001344/0001344878/V44300/z05587L1f.exe"
 
-# === LOG ===
-$LogDir="C:\ProgramData\OpenCars\setup-logs"; New-Item -Force -ItemType Directory -Path $LogDir | Out-Null
+# ===================== LOG =====================
+$LogDir="C:\ProgramData\OpenCars\setup-logs"
+New-Item -Force -ItemType Directory -Path $LogDir | Out-Null
 $Log=Join-Path $LogDir ("setup-{0:yyyyMMdd-HHmmss}-{1}.log" -f (Get-Date),$env:COMPUTERNAME)
 function Log([string]$m,[string]$lvl="INFO"){ "[{0:yyyy-MM-dd HH:mm:ss}] [{1}] {2}" -f (Get-Date),$lvl,$m | Tee-Object -FilePath $Log -Append }
 
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
 
-# === Helpers ===
+# ===================== Helpers =====================
 function Get-File([string]$Url,[string]$Name){
   $dst=Join-Path $env:TEMP $Name
-  for($i=1;$i -le 3;$i++){ try{ Log "Descarga ($i/3): $Url"; Invoke-WebRequest -Uri $Url -OutFile $dst -UseBasicParsing -TimeoutSec 180; break } catch { Start-Sleep 2; if($i -eq 3){ Log "Fallo descarga: $Url" "ERROR"; return $null } } }
-  if((Get-Item $dst -EA SilentlyContinue).Length -lt 10240){ Log "Descarga sospechosa (muy pequeña): $Url" "WARN" }
+  for($i=1;$i -le 3;$i++){
+    try{ Log "Descarga ($i/3): $Url"; Invoke-WebRequest -Uri $Url -OutFile $dst -UseBasicParsing -TimeoutSec 300; break }
+    catch{ Start-Sleep 2; if($i -eq 3){ Log "Fallo descarga: $Url" "ERROR"; return $null } }
+  }
   return $dst
 }
-function Convert-ToJpgIfNeeded([string]$Src){
-  $ext=[IO.Path]::GetExtension($Src).ToLower()
-  if($ext -in ".jpg",".jpeg",".png",".bmp"){ return $Src }
-  try{
-    Add-Type -AssemblyName System.Drawing -EA SilentlyContinue
-    $img=[System.Drawing.Image]::FromFile($Src)
-    $dst=Join-Path $env:TEMP (([IO.Path]::GetFileNameWithoutExtension($Src))+".jpg")
-    $img.Save($dst,[System.Drawing.Imaging.ImageFormat]::Jpeg); $img.Dispose()
-    Log "Convertido $ext -> JPG: $dst"; return $dst
-  } catch { Log "No se pudo convertir $Src a JPG" "WARN"; return $Src }
+
+function Winget-Ensure(){
+  if(-not (Get-Command winget -EA SilentlyContinue)){ Log "No se encontró winget (App Installer)." "ERROR"; exit 1 }
+  try{ winget source update | Out-Null } catch {}
 }
-function Winget-Ensure(){ if(-not (Get-Command winget -EA SilentlyContinue)){ Log "No se encontró winget (App Installer). Aborto." "ERROR"; exit 1 }
-  winget source update | Out-Null
-}
+
 function Install-App([string]$Id,[string]$Name){
   $exists = winget list -e --id $Id 2>$null | Select-String $Id
   if($exists){ Log "OK (ya instalado): $Name"; return $true }
@@ -50,49 +54,97 @@ function Install-App([string]$Id,[string]$Name){
   $ok = (winget list -e --id $Id 2>$null | Select-String $Id)
   if($ok){ Log "OK: $Name"; return $true } else { Log "No quedó instalado: $Name" "WARN"; return $false }
 }
+
 function Install-ExeSilent([string]$Exe,[string[]]$Tries=@('/s /v"/qn REBOOT=ReallySuppress"','/s /v"/qn /norestart"','/quiet /norestart','/S','/silent','/verysilent')){
-  foreach($a in $Tries){ try{ Log "Instalando EXE: $Exe $a"; Start-Process $Exe -ArgumentList $a -Wait -NoNewWindow; if($LASTEXITCODE -eq 0){ return $true } } catch {} }
+  foreach($a in $Tries){
+    try{
+      Log "Instalando EXE: $Exe $a"
+      Start-Process $Exe -ArgumentList $a -Wait -NoNewWindow
+      if($LASTEXITCODE -eq 0){ Log "OK (EXE): $Exe"; return $true }
+    } catch {}
+  }
+  Log "No se pudo instalar EXE en modo silencioso: $Exe" "WARN"
   return $false
 }
 
-# === Fondo y LockScreen ===
+# ===== Conversión JFIF/lo que sea → JPG (WPF/WIC) + Aplicar Wallpaper por SPI =====
+Add-Type -AssemblyName PresentationCore,WindowsBase -ErrorAction SilentlyContinue
+Add-Type @"
+using System.Runtime.InteropServices;
+public class Native {
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+}
+"@
+
+function Convert-ToJpgIfNeeded([string]$SrcPath){
+  try{
+    $dst = Join-Path $env:TEMP (([IO.Path]::GetFileNameWithoutExtension($SrcPath)) + ".jpg")
+    $stream = [System.IO.File]::OpenRead($SrcPath)
+    $decoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create(
+      $stream,
+      [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+      [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+    )
+    $frame = $decoder.Frames[0]
+    $encoder = New-Object System.Windows.Media.Imaging.JpegBitmapEncoder
+    $encoder.QualityLevel = 95
+    $encoder.Frames.Add($frame)
+    $out = [System.IO.File]::Create($dst)
+    $encoder.Save($out)
+    $out.Close(); $stream.Close()
+    return $dst
+  } catch { return $SrcPath }
+}
+
 function Apply-Wallpaper([string]$Url){
-  $src=Get-File $Url "wallpaper_src"; if(-not $src){ return }
-  $img=Convert-ToJpgIfNeeded $src
+  $src = Get-File $Url "wallpaper_src"; if(-not $src){ return }
+  $img = Convert-ToJpgIfNeeded $src
   $dstDir="C:\ProgramData\OpenCars\wallpaper"; New-Item -Force -ItemType Directory -Path $dstDir | Out-Null
   $dst=Join-Path $dstDir "wallpaper.jpg"; Copy-Item $img $dst -Force
-  New-ItemProperty "HKCU:\Control Panel\Desktop" -Name Wallpaper      -Value $dst -PropertyType String -Force | Out-Null
-  New-ItemProperty "HKCU:\Control Panel\Desktop" -Name WallpaperStyle -Value "10" -PropertyType String -Force | Out-Null
-  New-ItemProperty "HKCU:\Control Panel\Desktop" -Name TileWallpaper  -Value "0"  -PropertyType String -Force | Out-Null
-  RUNDLL32.EXE user32.dll, UpdatePerUserSystemParameters
+  # SPI_SETDESKWALLPAPER=20 ; SPIF_UPDATEINIFILE|SPIF_SENDWININICHANGE = 0x01|0x02 = 3
+  [void][Native]::SystemParametersInfo(20,0,$dst,3)
   Log "Fondo aplicado: $dst"
 }
+
 function Apply-LockScreen([string]$Url){
   $src=Get-File $Url "lock_src"; if(-not $src){ return }
   $img=Convert-ToJpgIfNeeded $src
   $dstDir="C:\ProgramData\OpenCars\lock"; New-Item -Force -ItemType Directory -Path $dstDir | Out-Null
   $dst=Join-Path $dstDir "lock.jpg"; Copy-Item $img $dst -Force
-  # Desactivar Spotlight y fijar imagen (Windows 10/11 Pro/Ent/Edu)
+
   $pol="HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization"
   if(-not (Test-Path $pol)){ New-Item $pol -Force | Out-Null }
   New-ItemProperty $pol -Name "LockScreenImage" -Value $dst -PropertyType String -Force | Out-Null
+
   $cloud="HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent"
   if(-not (Test-Path $cloud)){ New-Item $cloud -Force | Out-Null }
   New-ItemProperty $cloud -Name "DisableWindowsSpotlightOnSettings" -Value 1 -PropertyType DWord -Force | Out-Null
   New-ItemProperty $cloud -Name "DisableWindowsSpotlightFeatures"   -Value 1 -PropertyType DWord -Force | Out-Null
-  Log "Lock screen fijado: $dst (puede requerir bloqueo/reinicio)"
+
+  Log "Lock screen fijado: $dst (bloqueá con Win+L o reiniciá sesión)"
 }
 
-# === Office (ODT: Word/Excel/PowerPoint) ===
-function Install-OfficeODT{
-  # Instala ODT
-  if(-not (Install-App "Microsoft.OfficeDeploymentTool" "Office Deployment Tool")){ return $false }
-  $odtPath=(Get-ChildItem "$env:ProgramFiles\Microsoft Office\Office Deployment Tool\setup.exe" -EA SilentlyContinue).FullName
-  if(-not $odtPath){ $odtPath = (Get-ChildItem "$env:ProgramFiles(x86)\Microsoft Office\Office Deployment Tool\setup.exe" -EA SilentlyContinue).FullName }
-  if(-not $odtPath){ Log "No se encontró setup.exe de ODT" "ERROR"; return $false }
+function Set-ThemeDark{
+  $key="HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+  if(-not (Test-Path $key)){ New-Item $key | Out-Null }
+  New-ItemProperty $key -Name "AppsUseLightTheme" -Value 0 -PropertyType DWord -Force | Out-Null
+  New-ItemProperty $key -Name "SystemUsesLightTheme" -Value 0 -PropertyType DWord -Force | Out-Null
+  Log "Tema oscuro aplicado."
+}
 
-  $cfgDir=Join-Path $env:TEMP "ODT"; New-Item -Force -ItemType Directory -Path $cfgDir | Out-Null
-  $xml = @"
+# ===================== Office (ODT directo oficial) =====================
+function Install-OfficeODT{
+  $odtExe = Get-File "https://go.microsoft.com/fwlink/?linkid=2157037" "officedeploymenttool.exe"
+  if(-not $odtExe){ Log "No se pudo descargar ODT" "ERROR"; return $false }
+
+  $odtDir = Join-Path $env:TEMP "ODT"; New-Item -ItemType Directory -Force -Path $odtDir | Out-Null
+  Start-Process $odtExe -ArgumentList "/quiet /extract:`"$odtDir`"" -Wait
+  $setup = Join-Path $odtDir "setup.exe"
+  if(-not (Test-Path $setup)){ Log "ODT setup.exe no encontrado" "ERROR"; return $false }
+
+  $cfg = Join-Path $odtDir "office-config.xml"
+@"
 <Configuration>
   <Add OfficeClientEdition="64" Channel="Current">
     <Product ID="O365ProPlusRetail">
@@ -109,17 +161,18 @@ function Install-OfficeODT{
   <Display Level="None" AcceptEULA="TRUE"/>
   <Property Name="AUTOACTIVATE" Value="1"/>
 </Configuration>
-"@
-  $cfg = Join-Path $cfgDir "office-config.xml"; $xml | Out-File -Encoding ascii $cfg
-  Log "Descargando e instalando Office (Word/Excel/PowerPoint)..."
-  Start-Process $odtPath -ArgumentList "/configure `"$cfg`"" -Wait -NoNewWindow
+"@ | Out-File -Encoding ascii $cfg
+
+  Log "Instalando Microsoft 365 (Word/Excel/PowerPoint) vía ODT..."
+  Start-Process $setup -ArgumentList "/configure `"$cfg`"" -Wait -NoNewWindow
+
   $apps=@("WINWORD.EXE","EXCEL.EXE","POWERPNT.EXE")
   $ok=$true; foreach($a in $apps){ if(-not (Get-Command $a -EA SilentlyContinue)){ $ok=$false } }
-  if($ok){ Log "OK: Microsoft 365 (W/E/P) instalado" } else { Log "Office no verificado; revisar más tarde" "WARN" }
+  if($ok){ Log "OK: Microsoft 365 (W/E/P) instalado" } else { Log "Office no verificado (puede requerir login/licencia)" "WARN" }
   return $ok
 }
 
-# === Ricoh / Quiter ===
+# ===================== Ricoh / Quiter =====================
 function Install-Ricoh([string]$Url){
   $pkg=Get-File $Url "Ricoh_PCL6.exe"; if(-not $pkg){ return $false }
   $ok=Install-ExeSilent $pkg @('/s /v"/qn REBOOT=ReallySuppress"','/s /v"/qn /norestart"','/quiet /norestart')
@@ -129,43 +182,40 @@ function Install-Ricoh([string]$Url){
 function Install-Quiter([string]$Url){
   $pkg=Get-File $Url "quiter.exe"; if(-not $pkg){ return $false }
   $ok=Install-ExeSilent $pkg
-  if($ok){ Log "OK: Quiter" } else { Log "Quiter no confirmada (puede requerir instalador MSI/switches propios)" "WARN" }
+  if($ok){ Log "OK: Quiter" } else { Log "Quiter no confirmada (revisar switches/MSI)" "WARN" }
   return $ok
 }
 
-# === RUN ===
-Log "=== OpenCars Setup v1.7 ==="
+# ===================== RUN =====================
+Log "=== OpenCars Setup v1.8 ==="
 Winget-Ensure
 
-# Acrobat / Chrome / WinRAR / TeamViewer / AnyDesk / WireGuard
-Install-App "Adobe.Acrobat.Reader.64-bit" "Adobe Acrobat Reader"        # :contentReference[oaicite:0]{index=0}
-Install-App "Google.Chrome"                    "Google Chrome"            # :contentReference[oaicite:1]{index=1}
-Install-App "RARLab.WinRAR"                    "WinRAR"                   # :contentReference[oaicite:2]{index=2}
-if(Install-App "TeamViewer.TeamViewer"         "TeamViewer"){ winget upgrade -e --id TeamViewer.TeamViewer --silent | Out-Null }  # :contentReference[oaicite:3]{index=3}
-# AnyDesk: winget id y fallback MSI oficial
-if(-not (Install-App "AnyDeskSoftwareGmbH.AnyDesk" "AnyDesk")){  # :contentReference[oaicite:4]{index=4}
-  $msi = Get-File "https://download.anydesk.com/AnyDesk.msi" "AnyDesk.msi"  # :contentReference[oaicite:5]{index=5}
-  if($msi){ if(Install-ExeSilent $msi @('/qn /norestart')){ Log "OK: AnyDesk (MSI)" } }
+# Apps winget (con upgrade para TeamViewer)
+Install-App "Adobe.Acrobat.Reader.64-bit" "Adobe Acrobat Reader"
+Install-App "Google.Chrome"               "Google Chrome"
+Install-App "RARLab.WinRAR"               "WinRAR"
+if(Install-App "TeamViewer.TeamViewer"    "TeamViewer"){ try{ winget upgrade -e --id TeamViewer.TeamViewer --silent | Out-Null }catch{} }
+# AnyDesk: winget + fallback MSI oficial
+$ad_ok = Install-App "AnyDeskSoftwareGmbH.AnyDesk" "AnyDesk"
+if(-not $ad_ok){
+  $msi = Get-File "https://download.anydesk.com/AnyDesk.msi" "AnyDesk.msi"
+  if($msi){
+    if(Install-ExeSilent $msi @('/qn /norestart')){ Log "OK: AnyDesk (MSI)" } else { Log "AnyDesk MSI no confirmó instalación" "WARN" }
+  } else { Log "No se pudo descargar AnyDesk MSI" "WARN" }
 }
-# WireGuard: intento + verificación
-if(-not (Install-App "WireGuard.WireGuard" "WireGuard")){ Start-Sleep 2; Install-App "WireGuard.WireGuard" "WireGuard" }  # :contentReference[oaicite:6]{index=6}
+# WireGuard (reintento si hace falta)
+if(-not (Install-App "WireGuard.WireGuard" "WireGuard")){ Start-Sleep 2; Install-App "WireGuard.WireGuard" "WireGuard" }
 
-# Office (ODT: Word/Excel/PowerPoint)
-Install-OfficeODT  # :contentReference[oaicite:7]{index=7}
+# Office 365 (W/E/P) vía ODT
+Install-OfficeODT
 
 # Ricoh + Quiter
 Install-Ricoh  $RicohDriverUrl
 Install-Quiter $QuiterUrl
 
 # Tema + Fondos
-# (Tema oscuro)
-$key="HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-if(-not (Test-Path $key)){ New-Item $key | Out-Null }
-New-ItemProperty $key -Name "AppsUseLightTheme" -Value 0 -PropertyType DWord -Force | Out-Null
-New-ItemProperty $key -Name "SystemUsesLightTheme" -Value 0 -PropertyType DWord -Force | Out-Null
-Log "Tema oscuro aplicado."
-
+Set-ThemeDark
 Apply-Wallpaper  $WallpaperUrl
-Apply-LockScreen $LockScreenUrl  # :contentReference[oaicite:8]{index=8}
+Apply-LockScreen $LockScreenUrl
 
-Log "=== Fin. Si Office/WireGuard no aparecen de inmediato, reiniciá sesión/equipo. Logs: $Log ==="
+Log "=== Fin. Si algo no se ve aún (Office/Fondos), cerrá sesión o reiniciá. Logs: $Log ==="
