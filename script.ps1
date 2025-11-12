@@ -1,6 +1,21 @@
-<# OpenCars Setup v1.5 - Instala apps + Quiter + Ricoh + Fondo/Lock + Tema #>
+<# OpenCars Setup v1.6 - Auto-elevate + Instaladores + Tema/Fondo/LockScreen + Ricoh #>
 
-# ==== URLs (según tu repo y Ricoh) ====
+# --- Auto-elevate (ejecutar como administrador automáticamente) ---
+$currUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($currUser)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "Reiniciando con privilegios de administrador..."
+    $psi = @{
+        FilePath     = "powershell.exe"
+        ArgumentList = "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        Verb         = "RunAs"
+    }
+    Start-Process @psi
+    exit
+}
+# --- fin auto-elevate ---
+
+# ==== URLs ====
 $WallpaperUrl   = "https://raw.githubusercontent.com/Fortecar/setup/main/Tumbnail.jfif"
 $LockScreenUrl  = "https://raw.githubusercontent.com/Fortecar/setup/main/Tumbnail.jfif"
 $QuiterUrl      = "https://raw.githubusercontent.com/Fortecar/setup/main/quiter.exe"
@@ -11,21 +26,8 @@ $LogDir="C:\ProgramData\OpenCars\setup-logs"; New-Item -ItemType Directory -Forc
 $LogFile=Join-Path $LogDir ("setup-{0:yyyyMMdd-HHmmss}-{1}.log" -f (Get-Date), $env:COMPUTERNAME)
 function Log([string]$m,[string]$lvl="INFO"){ "[{0:yyyy-MM-dd HH:mm:ss}] [{1}] {2}" -f (Get-Date),$lvl,$m | Tee-Object -FilePath $LogFile -Append }
 
-# ==== PRERREQUISITOS ====
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-function Ensure-Admin{
-  $isAdmin=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-  ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-  if(-not $isAdmin){ Log "Ejecutar PowerShell como Administrador." "ERROR"; exit 1 }
-}
-function Ensure-Winget{
-  if(-not (Get-Command winget -ErrorAction SilentlyContinue)){
-    Log "No se encontró winget (App Installer). Aborto." "ERROR"; exit 1
-  }
-}
-Ensure-Admin
-
 # ==== UTILIDADES ====
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 function Get-File([string]$Url,[string]$Name){
   $dst = Join-Path $env:TEMP $Name
   for($i=1;$i -le 3;$i++){
@@ -46,6 +48,7 @@ function Convert-ToJpgIfNeeded([string]$SrcPath){
   } catch { Log "No se pudo convertir $SrcPath a JPG, se usará tal cual." "WARN"; return $SrcPath }
 }
 function Install-App([string]$Id,[string]$Name){
+  if(-not (Get-Command winget -ErrorAction SilentlyContinue)){ Log "No se encontró winget (App Installer)." "ERROR"; return }
   $exists = winget list --id $Id --accept-source-agreements 2>$null | Select-String $Id
   if($exists){ Log "OK (ya instalado): $Name"; return }
   Log "Instalando: $Name"
@@ -58,10 +61,6 @@ function Install-ExeSilent([string]$ExePath,[string[]]$Tries=@('/s /v"/qn REBOOT
       if($LASTEXITCODE -eq 0){ Log "OK (EXE): $ExePath"; return $true } } catch {}
   }
   Log "No se pudo instalar EXE en modo silencioso: $ExePath" "WARN"; return $false
-}
-function Install-MSI([string]$MsiPath){
-  Start-Process "msiexec.exe" -ArgumentList "/i `"$MsiPath`" /qn /norestart" -Wait -NoNewWindow
-  if($LASTEXITCODE -eq 0){ Log "OK (MSI): $MsiPath"; return $true } else { Log "Error MSI (exit $LASTEXITCODE): $MsiPath" "WARN"; return $false }
 }
 function Set-ThemeDark{
   $key="HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
@@ -90,9 +89,8 @@ function Set-LockScreen([string]$Url){
   Log "Pantalla de bloqueo configurada."
 }
 
-# ==== INSTALACIONES ====
-Ensure-Winget
-Log "Instalación de aplicaciones (winget) ..."
+# ==== INSTALACIÓN ====
+Log "=== OpenCars Setup iniciado ==="
 Install-App "Adobe.Acrobat.Reader.64-bit" "Adobe Acrobat Reader DC"
 Install-App "Google.Chrome"               "Google Chrome"
 Install-App "Microsoft.Office"            "Microsoft 365 Apps (Office)"
@@ -101,7 +99,7 @@ Install-App "RARLab.WinRAR"               "WinRAR"
 Install-App "TeamViewer.TeamViewer"       "TeamViewer"
 Install-App "AnyDeskSoftwareGmbH.AnyDesk" "AnyDesk"
 
-# Quiter (EXE público desde GitHub)
+# Quiter (EXE desde GitHub)
 $quiter = Get-File $QuiterUrl "quiter.exe"
 if($quiter){ if(-not (Install-ExeSilent $quiter)){ Log "Instalación de Quiter no confirmada" "WARN" } }
 
@@ -114,4 +112,4 @@ Set-ThemeDark
 Set-Wallpaper  $WallpaperUrl
 Set-LockScreen $LockScreenUrl
 
-Log "Finalizado. Si no ves el tema/fondos, cerrá sesión o reiniciá."
+Log "=== Instalación completada. Cerrá sesión o reiniciá para ver todos los cambios. ==="
